@@ -1,0 +1,57 @@
+#!/bin/bash
+
+DESKTOP_DIR="$HOME/.local/share/applications/"
+
+# Find all web apps
+declare -a WEB_APPS
+while IFS= read -r -d '' file; do
+  if grep -q '^Exec=.*\(webapp-launch\|omarchy-launch-webapp\|omarchy-webapp-handler\).*' "$file"; then
+    WEB_APPS+=("$file")
+  fi
+done < <(find "$DESKTOP_DIR" -name '*.desktop' -print0)
+
+if [[ ${#WEB_APPS[@]} -eq 0 ]]; then
+  echo "No web apps installed."
+  exit 0
+fi
+
+# Sort web apps by name
+IFS=$'\n' SORTED_WEB_APPS=($(sort <<<"${WEB_APPS[*]}"))
+unset IFS
+
+echo -e "\e[1;36m╔════════════════════════════════════════════════════════════════════╗"
+echo -e "║                    Installed Web Apps                          ║"
+echo -e "╚════════════════════════════════════════════════════════════════════╝\e[0m\n"
+
+for file in "${SORTED_WEB_APPS[@]}"; do
+  # Extract information from .desktop file
+  APP_NAME=$(grep '^Name=' "$file" | sed 's/^Name=//')
+  EXEC_LINE=$(grep '^Exec=' "$file" | sed 's/^Exec=//')
+  ICON=$(grep '^Icon=' "$file" | sed 's/^Icon=//')
+
+  # Extract URL from Exec line
+  # Matches patterns like: webapp-launch URL or webapp-launch "URL" APP_NAME
+  if [[ $EXEC_LINE =~ webapp-launch[[:space:]]+([^[:space:]\"]+) ]]; then
+    URL="${BASH_REMATCH[1]}"
+  elif [[ $EXEC_LINE =~ webapp-launch[[:space:]]+\"([^\"]+)\" ]]; then
+    URL="${BASH_REMATCH[1]}"
+  else
+    URL="(unknown)"
+  fi
+
+  # Check if icon exists
+  if [[ -f "$ICON" ]]; then
+    ICON_STATUS="\e[32m✓\e[0m"
+    ICON_COLOR="\e[32m"
+  else
+    ICON_STATUS="\e[31m✗\e[0m"
+    ICON_COLOR="\e[31m"
+  fi
+
+  echo -e "\e[1;33m▸\e[0m \e[1;97m$APP_NAME\e[0m"
+  echo -e "  \e[36m🌐 URL:\e[0m  \e[94m$URL\e[0m"
+  echo -e "  \e[36m🖼️  Icon:\e[0m  $ICON_STATUS $ICON_COLOR$ICON\e[0m"
+  echo -e "  \e[90m────────────────────────────────────────────────────────────────────\e[0m"
+done
+
+echo -e "\n\e[1;32m📊 Total: ${#SORTED_WEB_APPS[@]} web app(s)\e[0m"

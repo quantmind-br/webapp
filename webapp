@@ -1,0 +1,393 @@
+#!/bin/bash
+
+ICON_DIR="$HOME/.local/share/applications/icons"
+DESKTOP_DIR="$HOME/.local/share/applications/"
+
+# Function to install a new webapp
+install_webapp() {
+  echo -e "\e[32mLet's create a new web app you can start with the app launcher.\e[0m\n"
+
+  APP_NAME=$(gum input --prompt "Name> " --placeholder "My favorite web app")
+  [[ -z "$APP_NAME" ]] && echo "Installation cancelled." && return
+
+  APP_URL=$(gum input --prompt "URL> " --placeholder "https://example.com")
+  [[ -z "$APP_URL" ]] && echo "Installation cancelled." && return
+
+  ICON_REF=$(gum input --prompt "Icon URL> " --placeholder "See https://dashboardicons.com (must use PNG!)")
+  [[ -z "$ICON_REF" ]] && echo "Installation cancelled." && return
+
+  # Ask if user wants custom exec or mime types
+  ADVANCED=$(gum choose --header "Add advanced options?" "No" "Yes")
+
+  CUSTOM_EXEC=""
+  MIME_TYPES=""
+
+  if [[ "$ADVANCED" == "Yes" ]]; then
+    CUSTOM_EXEC=$(gum input --prompt "Custom Exec (optional)> " --placeholder "Leave empty for default")
+    MIME_TYPES=$(gum input --prompt "MIME types (optional)> " --placeholder "e.g., x-scheme-handler/mailto")
+  fi
+
+  # Sanitize filename
+  SAFE_FILENAME=$(echo "$APP_NAME" | tr -dc '[:alnum:]\-\_ ' | tr ' ' '_')
+  [[ -z "$SAFE_FILENAME" ]] && SAFE_FILENAME="webapp_$(date +%s)"
+
+  # Create icon directory
+  mkdir -p "$ICON_DIR"
+
+  # Handle icon download/copy
+  if [[ $ICON_REF =~ ^https?:// ]]; then
+    ICON_PATH="$ICON_DIR/$SAFE_FILENAME.png"
+    if curl -sL -o "$ICON_PATH" "$ICON_REF"; then
+      echo "Icon downloaded successfully."
+    else
+      echo "Error: Failed to download icon."
+      return 1
+    fi
+  elif [[ -f "$ICON_REF" ]]; then
+    ICON_PATH="$ICON_DIR/$SAFE_FILENAME.png"
+    if cp "$ICON_REF" "$ICON_PATH"; then
+      echo "Icon copied successfully from local path."
+    else
+      echo "Error: Failed to copy icon from $ICON_REF"
+      return 1
+    fi
+  else
+    ICON_PATH="$ICON_DIR/$ICON_REF"
+    if [[ ! -f "$ICON_PATH" ]]; then
+      echo "Error: Icon file not found at $ICON_PATH"
+      return 1
+    fi
+  fi
+
+  # Determine execution command
+  if [[ -n $CUSTOM_EXEC ]]; then
+    EXEC_COMMAND="$CUSTOM_EXEC"
+  else
+    LAUNCHER_PATH=$(command -v webapp-launch)
+    if [[ -z "$LAUNCHER_PATH" ]]; then
+      # Fallback: check if in current directory or typical script dirs
+      if [[ -f "$HOME/scripts/webapp-launch" ]]; then
+         LAUNCHER_PATH="$HOME/scripts/webapp-launch"
+      elif [[ -f "./webapp-launch" ]]; then
+         LAUNCHER_PATH="./webapp-launch"
+      else
+         echo "Warning: 'webapp-launch' helper script not found in PATH. Shortcuts might not work."
+         LAUNCHER_PATH="webapp-launch" # Hope it's in path at runtime
+      fi
+    fi
+    EXEC_COMMAND="$LAUNCHER_PATH $APP_URL $APP_NAME"
+  fi
+
+  # Generate StartupWMClass for Chromium webapps
+  # Extract domain and path from URL and convert to the format Chromium uses
+  # Chromium includes the path in WMClass: chrome-domain__path-Default
+  URL_WITHOUT_PROTOCOL=$(echo "$APP_URL" | sed -E 's|https?://||')
+  # Check if URL ends with / (has a path component even if empty)
+  if [[ "$URL_WITHOUT_PROTOCOL" =~ /$ ]]; then
+    # Remove trailing slash and add __ to indicate empty path
+    URL_FORMATTED=$(echo "$URL_WITHOUT_PROTOCOL" | sed -E 's|/$|__|' | sed -E 's|/|__|g')
+  else
+    # No path component, don't add __
+    URL_FORMATTED=$(echo "$URL_WITHOUT_PROTOCOL" | sed -E 's|/|__|g')
+  fi
+  STARTUP_WM_CLASS="chrome-${URL_FORMATTED}-Default"
+
+  # Create application .desktop file
+  DESKTOP_FILE="$DESKTOP_DIR/$SAFE_FILENAME.desktop"
+
+  cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Comment=$APP_NAME
+Exec=$EXEC_COMMAND
+Terminal=false
+Type=Application
+Icon=$ICON_PATH
+StartupWMClass=$STARTUP_WM_CLASS
+StartupNotify=true
+X-WebApp-Manager=true
+EOF
+
+  # Add mime types if provided
+  if [[ -n $MIME_TYPES ]]; then
+    echo "MimeType=$MIME_TYPES" >>"$DESKTOP_FILE"
+  fi
+
+  chmod +x "$DESKTOP_FILE"
+
+  # Update desktop database
+  update-desktop-database ~/.local/share/applications/ 2>/dev/null
+
+  # Update waybar app_ids-mapping
+  WAYBAR_MODULES="$HOME/.config/waybar/modules.json"
+  if [[ -f "$WAYBAR_MODULES" ]]; then
+    if command -v jq &>/dev/null; then
+      # Use jq to safely update the JSON
+      TMP_JSON=$(mktemp)
+      if jq --arg app "$APP_NAME" --arg class "$STARTUP_WM_CLASS" \
+         '."app_ids-mapping"[$class] = $app' "$WAYBAR_MODULES" > "$TMP_JSON"; then
+        mv "$TMP_JSON" "$WAYBAR_MODULES"
+        echo "Waybar configuration updated."
+      else
+        rm "$TMP_JSON"
+        echo "Error updating Waybar configuration with jq."
+      fi
+    else
+      echo "Warning: 'jq' not found. Skipping Waybar configuration update to prevent corruption."
+      echo "Please install 'jq' or manually add \"$STARTUP_WM_CLASS\": \"$APP_NAME\" to your modules.json."
+    fi
+  fi
+
+  echo -e "\n\e[32m✓ $APP_NAME installed successfully!\e[0m"
+  echo -e "You can now find it using the app launcher (SUPER + SPACE)"
+  echo -e "Restart waybar to see the icon in the taskbar: ~/.config/waybar/launch.sh\n"
+}
+
+# Function to launch a webapp
+launch_webapp() {
+  declare -a WEB_APPS
+  declare -a WEB_APP_FILES
+
+  while IFS= read -r -d '' file; do
+    if grep -q '^X-WebApp-Manager=true' "$file" || \
+       grep -q '^Exec=.*\(webapp-launch\|omarchy-launch-webapp\|omarchy-webapp-handler\).*' "$file"; then
+      APP_NAME=$(grep '^Name=' "$file" | sed 's/^Name=//')
+      FILENAME=$(basename "$file")
+      # Display format: "AppName [filename.desktop]" to ensure uniqueness
+      WEB_APPS+=("$APP_NAME [$FILENAME]")
+      WEB_APP_FILES+=("$file")
+    fi
+  done < <(find "$DESKTOP_DIR" -name '*.desktop' -print0)
+
+  if [[ ${#WEB_APPS[@]} -eq 0 ]]; then
+    echo "No web apps installed."
+    return 1
+  fi
+
+  IFS=$'\n' SORTED_INDICES=($(
+    for i in "${!WEB_APPS[@]}"; do
+      echo "$i|${WEB_APPS[$i]}"
+    done | sort -t'|' -k2 | cut -d'|' -f1
+  ))
+  unset IFS
+
+  declare -a SORTED_APPS
+  for idx in "${SORTED_INDICES[@]}"; do
+    SORTED_APPS+=("${WEB_APPS[$idx]}")
+  done
+
+  SELECTED=$(gum choose --header "Select web app to launch..." "${SORTED_APPS[@]}")
+
+  if [[ -n "$SELECTED" ]]; then
+    # Find the original index
+    for i in "${!WEB_APPS[@]}"; do
+      if [[ "${WEB_APPS[$i]}" == "$SELECTED" ]]; then
+        FILE="${WEB_APP_FILES[$i]}"
+        break
+      fi
+    done
+
+    APP_NAME_ONLY=$(grep '^Name=' "$FILE" | sed 's/^Name=//')
+    echo "Launching $APP_NAME_ONLY..."
+    gtk-launch "$(basename "$FILE")" &
+    disown
+  fi
+}
+
+# Function to list webapps
+list_webapps() {
+  declare -a WEB_APPS
+
+  while IFS= read -r -d '' file; do
+    if grep -q '^X-WebApp-Manager=true' "$file" || \
+       grep -q '^Exec=.*\(webapp-launch\|omarchy-launch-webapp\|omarchy-webapp-handler\).*' "$file"; then
+      WEB_APPS+=("$file")
+    fi
+  done < <(find "$DESKTOP_DIR" -name '*.desktop' -print0)
+
+  if [[ ${#WEB_APPS[@]} -eq 0 ]]; then
+    echo "No web apps installed."
+    return 0
+  fi
+
+  IFS=$'\n' SORTED_WEB_APPS=($(sort <<<"${WEB_APPS[*]}"))
+  unset IFS
+
+  echo -e "\e[1;36m╔════════════════════════════════════════════════════════════════════╗"
+  echo -e "║                    Installed Web Apps                          ║"
+  echo -e "╚════════════════════════════════════════════════════════════════════╝\e[0m\n"
+
+  for file in "${SORTED_WEB_APPS[@]}"; do
+    APP_NAME=$(grep '^Name=' "$file" | sed 's/^Name=//')
+    EXEC_LINE=$(grep '^Exec=' "$file" | sed 's/^Exec=//')
+    ICON=$(grep '^Icon=' "$file" | sed 's/^Icon=//')
+
+    if [[ $EXEC_LINE =~ webapp-launch[[:space:]]+([^[:space:]\"]+) ]]; then
+      URL="${BASH_REMATCH[1]}"
+    elif [[ $EXEC_LINE =~ webapp-launch[[:space:]]+\"([^\"]+)\" ]]; then
+      URL="${BASH_REMATCH[1]}"
+    else
+      URL="(custom/unknown)"
+    fi
+
+    if [[ -f "$ICON" ]]; then
+      ICON_STATUS="\e[32m✓\e[0m"
+      ICON_COLOR="\e[32m"
+    else
+      ICON_STATUS="\e[31m✗\e[0m"
+      ICON_COLOR="\e[31m"
+    fi
+
+    echo -e "\e[1;33m▸\e[0m \e[1;97m$APP_NAME\e[0m"
+    echo -e "  \e[36m🌐 URL:\e[0m  \e[94m$URL\e[0m"
+    echo -e "  \e[36m🖼️  Icon:\e[0m  $ICON_STATUS $ICON_COLOR$ICON\e[0m"
+    echo -e "  \e[90m────────────────────────────────────────────────────────────────────\e[0m"
+  done
+
+  echo -e "\n\e[1;32m📊 Total: ${#SORTED_WEB_APPS[@]} web app(s)\e[0m"
+  echo ""
+}
+
+# Function to remove webapps
+remove_webapp() {
+  declare -a WEB_APPS
+  declare -a WEB_APP_FILES
+
+  while IFS= read -r -d '' file; do
+    if grep -q '^X-WebApp-Manager=true' "$file" || \
+       grep -q '^Exec=.*\(webapp-launch\|omarchy-launch-webapp\|omarchy-webapp-handler\).*' "$file"; then
+      APP_NAME=$(grep '^Name=' "$file" | sed 's/^Name=//')
+      FILENAME=$(basename "$file")
+      WEB_APPS+=("$APP_NAME [$FILENAME]")
+      WEB_APP_FILES+=("$file")
+    fi
+  done < <(find "$DESKTOP_DIR" -name '*.desktop' -print0)
+
+  if [[ ${#WEB_APPS[@]} -eq 0 ]]; then
+    echo "No web apps to remove."
+    return 1
+  fi
+
+  IFS=$'\n' SORTED_INDICES=($(
+    for i in "${!WEB_APPS[@]}"; do
+      echo "$i|${WEB_APPS[$i]}"
+    done | sort -t'|' -k2 | cut -d'|' -f1
+  ))
+  unset IFS
+
+  declare -a SORTED_OPTS
+  for idx in "${SORTED_INDICES[@]}"; do
+    SORTED_OPTS+=("${WEB_APPS[$idx]}")
+  done
+
+  SELECTED_STRING=$(gum choose --no-limit --header "Select web app(s) to remove..." --selected-prefix="✗ " "${SORTED_OPTS[@]}")
+
+  if [[ -z "$SELECTED_STRING" ]]; then
+    echo "No web apps selected."
+    return 0
+  fi
+
+  # Parse selections
+  declare -a TARGET_FILES
+  declare -a TARGET_NAMES
+  
+  IFS=$'\n'
+  for selection in $SELECTED_STRING; do
+    for i in "${!WEB_APPS[@]}"; do
+      if [[ "${WEB_APPS[$i]}" == "$selection" ]]; then
+        TARGET_FILES+=("${WEB_APP_FILES[$i]}")
+        # Extract name from selection string (everything before the last space and bracket)
+        # Actually easier to just grab it from the file again or use the stored map
+        NAME=$(grep '^Name=' "${WEB_APP_FILES[$i]}" | sed 's/^Name=//')
+        TARGET_NAMES+=("$NAME")
+        break
+      fi
+    done
+  done
+  unset IFS
+
+  # Confirm removal
+  CONFIRM=$(gum choose --header "Remove ${#TARGET_FILES[@]} web app(s)?" "No" "Yes")
+
+  if [[ "$CONFIRM" == "Yes" ]]; then
+    for i in "${!TARGET_FILES[@]}"; do
+      FILE="${TARGET_FILES[$i]}"
+      APP_NAME="${TARGET_NAMES[$i]}"
+      
+      # Extract icon path before deleting
+      ICON_PATH=$(grep '^Icon=' "$FILE" | sed 's/^Icon=//')
+      
+      # Remove Desktop File
+      rm -f "$FILE"
+      echo "✓ Removed desktop file for $APP_NAME"
+      
+      # Remove Icon only if it is inside our managed icon directory
+      if [[ "$ICON_PATH" == "$ICON_DIR"* && -f "$ICON_PATH" ]]; then
+        rm -f "$ICON_PATH"
+        echo "✓ Removed icon: $ICON_PATH"
+      elif [[ -n "$ICON_PATH" && -f "$ICON_PATH" ]]; then
+        echo "ℹ Skipped external icon: $ICON_PATH"
+      fi
+    done
+
+    update-desktop-database ~/.local/share/applications/ 2>/dev/null
+    echo -e "\n\e[32mRemoval completed!\e[0m\n"
+  else
+    echo "Removal cancelled."
+  fi
+}
+
+# Main menu loop
+main_menu() {
+  while true; do
+    echo -e "\e[32m╔════════════════════════════════════╗"
+    echo -e "║       Web App Manager              ║"
+    echo -e "╚════════════════════════════════════╝\e[0m\n"
+
+    ACTION=$(gum choose --header "What would you like to do?" \
+      "Install new web app" \
+      "Launch web app" \
+      "List installed web apps" \
+      "Remove web app(s)" \
+      "Exit")
+
+    echo ""
+
+    case "$ACTION" in
+      "Install new web app")
+        install_webapp
+        ;;
+      "Launch web app")
+        launch_webapp
+        ;;
+      "List installed web apps")
+        list_webapps
+        ;;
+      "Remove web app(s)")
+        remove_webapp
+        ;;
+      "Exit")
+        echo "Goodbye!"
+        exit 0
+        ;;
+      *)
+        echo "Invalid option."
+        ;;
+    esac
+
+    echo ""
+    gum input --prompt "Press Enter to continue..." --placeholder "" >/dev/null
+    clear
+  done
+}
+
+# Check if gum is installed
+if ! command -v gum &>/dev/null; then
+  echo "Error: 'gum' is required but not installed."
+  echo "Install it from: https://github.com/charmbracelet/gum"
+  exit 1
+fi
+
+# Run main menu
+main_menu
