@@ -1,0 +1,365 @@
+#!/bin/bash
+
+# Unified Webapp Manager
+# Handles installation, removal, and launching of web apps.
+# Compatible with nwg-dock-hyprland.
+
+ICON_DIR="$HOME/.local/share/icons"
+DESKTOP_DIR="$HOME/.local/share/applications"
+mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
+
+function show_help() {
+    echo "Usage: webapp <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install   Install a new web app"
+    echo "  remove    Remove an existing web app"
+    echo "  list      List installed web apps"
+    echo "  launch    Launch a web app (internal use)"
+    echo ""
+    echo "Install Options:"
+    echo "  --name <name>       App name"
+    echo "  --url <url>         App URL"
+    echo "  --icon <path|url>   Icon path or URL"
+    echo ""
+    echo "Launch Options:"
+    echo "  --class <slug>      Window class (slug)"
+    echo "  --url <url>         URL to open"
+}
+
+function slugify() {
+    echo "$1" | iconv -t ascii//TRANSLIT | sed -r s/[^a-zA-Z0-9]+/-/g | sed -r s/^-+\|-+$//g
+}
+
+function install_app() {
+    local APP_NAME=""
+    local APP_URL=""
+    local ICON_REF=""
+
+    # Parse arguments
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            --name) APP_NAME="$2"; shift ;;
+            --url) APP_URL="$2"; shift ;;
+            --icon) ICON_REF="$2"; shift ;;
+            *) ;;
+        esac
+        shift
+    done
+
+    # Interactive mode if arguments missing
+    if [[ -z "$APP_NAME" || -z "$APP_URL" || -z "$ICON_REF" ]]; then
+        if command -v gum &> /dev/null; then
+            [[ -z "$APP_NAME" ]] && APP_NAME=$(gum input --prompt "App Name> " --placeholder "My App")
+            [[ -z "$APP_URL" ]] && APP_URL=$(gum input --prompt "URL> " --placeholder "https://example.com")
+            [[ -z "$ICON_REF" ]] && ICON_REF=$(gum input --prompt "Icon (Path or URL)> " --placeholder "Path or URL")
+        else
+            [[ -z "$APP_NAME" ]] && read -p "App Name: " APP_NAME
+            [[ -z "$APP_URL" ]] && read -p "URL: " APP_URL
+            [[ -z "$ICON_REF" ]] && read -p "Icon (Path or URL): " ICON_REF
+        fi
+    fi
+
+    if [[ -z "$APP_NAME" || -z "$APP_URL" || -z "$ICON_REF" ]]; then
+        echo "Error: Missing required fields."
+        exit 1
+    fi
+
+    local SLUG=$(slugify "$APP_NAME")
+    local ICON_DEST="$ICON_DIR/$SLUG.png"
+
+    # Handle Icon
+    local TEMP_ICON=$(mktemp)
+    if [[ "$ICON_REF" =~ ^https?:// ]]; then
+        echo "Downloading icon..."
+        if ! curl -sL -o "$TEMP_ICON" "$ICON_REF"; then
+            echo "Error: Failed to download icon."
+            rm "$TEMP_ICON"
+            exit 1
+        fi
+    elif [[ -f "$ICON_REF" ]]; then
+        echo "Copying local icon..."
+        cp "$ICON_REF" "$TEMP_ICON"
+    else
+        echo "Error: Icon not found or invalid URL."
+        rm "$TEMP_ICON"
+        exit 1
+    fi
+
+    # Convert to PNG using magick if available, otherwise just move
+    if command -v magick &> /dev/null; then
+        echo "Processing icon..."
+        # Detect file type to give magick a hint
+        local MIME=$(file -b --mime-type "$TEMP_ICON")
+        local EXT=""
+        case "$MIME" in
+            image/vnd.microsoft.icon|image/x-icon) EXT="ico" ;;
+            image/png) EXT="png" ;;
+            image/jpeg) EXT="jpg" ;;
+            image/svg+xml) EXT="svg" ;;
+            image/webp) EXT="webp" ;;
+            *) ;;
+        esac
+
+        if [[ -n "$EXT" ]]; then
+            mv "$TEMP_ICON" "$TEMP_ICON.$EXT"
+            TEMP_ICON="$TEMP_ICON.$EXT"
+        fi
+
+        # Remove destination if it exists to avoid confusion
+        rm -f "$ICON_DEST"
+
+        # Try to convert (extract first frame [0] to avoid multiple files for ICO)
+        if ! magick "${TEMP_ICON}[0]" "$ICON_DEST"; then
+             echo "Warning: Image conversion failed. Using original file."
+             # If conversion failed, move the temp file (renaming back if needed)
+             mv "$TEMP_ICON" "$ICON_DEST"
+        fi
+    else
+        echo "Warning: 'magick' not found. Icon format might not be compatible if not PNG."
+        mv "$TEMP_ICON" "$ICON_DEST"
+    fi
+    rm -f "$TEMP_ICON"
+
+    # Create .desktop file
+    # IMPORTANT: Filename must match StartupWMClass for nwg-dock-hyprland
+    local DESKTOP_FILE="$DESKTOP_DIR/$SLUG.desktop"
+    
+    # Determine script path for Exec
+    # We use the absolute path of this script if possible, or assume 'webapp' is in PATH
+    local SCRIPT_PATH=$(realpath "$0")
+    
+    cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Comment=Web App: $APP_NAME
+Exec=$SCRIPT_PATH launch --class $SLUG --url "$APP_URL"
+Terminal=false
+Type=Application
+Icon=$ICON_DEST
+StartupWMClass=$SLUG
+Categories=Network;WebBrowser;
+EOF
+
+    chmod +x "$DESKTOP_FILE"
+    echo "Installed $APP_NAME ($SLUG)"
+}
+
+function remove_app() {
+    local REMOVE_SLUGS=()
+
+    if [[ "$#" -gt 0 ]]; then
+        REMOVE_SLUGS=("$@")
+    else
+        # Find apps managed by this script (Exec=.*webapp launch)
+        local APPS=()
+        local SLUGS=()
+        
+        shopt -s nullglob
+        for file in "$DESKTOP_DIR"/*.desktop; do
+            if grep -q "webapp launch" "$file"; then
+                local name=$(grep "^Name=" "$file" | cut -d= -f2)
+                local slug=$(basename "$file" .desktop)
+                APPS+=("$name ($slug)")
+                SLUGS+=("$slug")
+            fi
+        done
+        shopt -u nullglob
+
+        if [[ ${#APPS[@]} -eq 0 ]]; then
+            echo "No web apps found."
+            exit 0
+        fi
+
+        if command -v gum &> /dev/null; then
+            local SELECTION=$(gum choose --no-limit --header "Select apps to remove" "${APPS[@]}")
+            # Extract slugs from selection
+            IFS=$'\n'
+            for item in $SELECTION; do
+                # Extract slug from "Name (slug)"
+                local s=$(echo "$item" | sed 's/.*(\(.*\))/\1/')
+                REMOVE_SLUGS+=("$s")
+            done
+            unset IFS
+        else
+            echo "Available apps:"
+            for i in "${!APPS[@]}"; do
+                echo "$i) ${APPS[$i]}"
+            done
+            read -p "Enter index to remove: " IDX
+            REMOVE_SLUGS=("${SLUGS[$IDX]}")
+        fi
+    fi
+
+    for slug in "${REMOVE_SLUGS[@]}"; do
+        if [[ -f "$DESKTOP_DIR/$slug.desktop" ]]; then
+            rm -f "$DESKTOP_DIR/$slug.desktop"
+            rm -f "$ICON_DIR/$slug.png"
+            echo "Removed $slug"
+        else
+            echo "App $slug not found."
+        fi
+    done
+}
+
+function list_apps() {
+    echo "Installed Web Apps:"
+    echo "-------------------"
+    local FOUND=false
+    
+    shopt -s nullglob
+    for file in "$DESKTOP_DIR"/*.desktop; do
+        if grep -q "webapp launch" "$file"; then
+            local name=$(grep "^Name=" "$file" | cut -d= -f2)
+            local slug=$(basename "$file" .desktop)
+            echo "- $name ($slug)"
+            FOUND=true
+        fi
+    done
+    shopt -u nullglob
+
+    if [[ "$FOUND" == "false" ]]; then
+        echo "No web apps found."
+    fi
+}
+
+function launch_app() {
+    local CLASS=""
+    local URL=""
+
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            --class) CLASS="$2"; shift ;;
+            --url) URL="$2"; shift ;;
+            *) ;;
+        esac
+        shift
+    done
+
+    if [[ -z "$URL" ]]; then
+        echo "Error: URL required for launch."
+        exit 1
+    fi
+
+    # Detect browser
+    local BROWSER_EXEC=""
+    local DEFAULT_BROWSER=$(xdg-settings get default-web-browser)
+    
+    # Map desktop file to executable if possible, or use common names
+    case $DEFAULT_BROWSER in
+        google-chrome*) BROWSER_EXEC="google-chrome" ;;
+        brave-browser*) BROWSER_EXEC="brave-browser" ;;
+        microsoft-edge*) BROWSER_EXEC="microsoft-edge" ;;
+        opera*) BROWSER_EXEC="opera" ;;
+        vivaldi*) BROWSER_EXEC="vivaldi" ;;
+        chromium*) BROWSER_EXEC="chromium" ;;
+        *) BROWSER_EXEC="chromium" ;; # Fallback
+    esac
+
+    # Launch in background to monitor
+    # Use uwsm-app if available (Hyprland integration)
+    if command -v uwsm-app &> /dev/null; then
+        uwsm-app -- $BROWSER_EXEC --app="$URL" --class="$CLASS" --app-id="$CLASS" &
+        PID=$!
+    else
+        $BROWSER_EXEC --app="$URL" --class="$CLASS" --app-id="$CLASS" &>/dev/null &
+        PID=$!
+    fi
+
+    # Monitor for window creation and fix class mismatch
+    # Only if hyprctl and jq are available
+    if command -v hyprctl &> /dev/null && command -v jq &> /dev/null; then
+        (
+            # Wait up to 15 seconds for the window
+            for i in {1..30}; do
+                sleep 0.5
+                # Find window by PID (or approximate if PID namespace differs, but usually same user)
+                # We verify the title or initialClass matches slightly or just trust the PID.
+                # Since browser might fork, we look for windows with the same class OR related PID? 
+                # Best bet: Look for a window that recently appeared or matches our class OR the generated one.
+                
+                # Actually, we just want to see if a window with 'chromium' (or browser) class appears
+                # or if we can find our specific window.
+                
+                # Let's look for the PID first.
+                local ACTUAL_CLASS=$(hyprctl clients -j | jq -r ".[] | select(.pid == $PID or .initialTitle == \"$URL\" or (.class | contains(\"webapp\"))) | .class" | head -n1)
+                
+                # If PID match failed (common with wrapper scripts or chrome zygotes), try matching by Title closer to URL if possible,
+                # but URL in title is unreliable.
+                # Fallback strategy: Search for the specific chrome-generated class pattern if we can't find PID.
+                if [[ -z "$ACTUAL_CLASS" ]]; then
+                     # Try to find a window that looks like a chrome webapp for this URL? Hard.
+                     # Let's rely on the user interaction: if they just launched it, it's likely the active window or focused soon.
+                     # But safer: check for the 'chrome-...' pattern that matches our URL.
+                     # URL: https://www.notion.so/ -> chrome-www.notion.so
+                     local DOMAIN=$(echo "$URL" | awk -F/ '{print $3}')
+                     ACTUAL_CLASS=$(hyprctl clients -j | jq -r ".[] | select(.class | contains(\"$DOMAIN\")) | .class" | head -n1)
+                fi
+
+                if [[ -n "$ACTUAL_CLASS" && "$ACTUAL_CLASS" != "null" ]]; then
+                    if [[ "$ACTUAL_CLASS" != "$CLASS" ]]; then
+                        echo "Detected Class Mismatch: Expected '$CLASS', got '$ACTUAL_CLASS'. Fixing..."
+                        
+                        local OLD_DESKTOP="$DESKTOP_DIR/$CLASS.desktop"
+                        local NEW_DESKTOP="$DESKTOP_DIR/$ACTUAL_CLASS.desktop"
+                        local OLD_ICON="$ICON_DIR/$CLASS.png"
+                        local NEW_ICON="$ICON_DIR/$ACTUAL_CLASS.png"
+
+                        if [[ -f "$OLD_DESKTOP" ]]; then
+                            mv "$OLD_DESKTOP" "$NEW_DESKTOP"
+                            sed -i "s/StartupWMClass=$CLASS/StartupWMClass=$ACTUAL_CLASS/" "$NEW_DESKTOP"
+                            # We do NOT change the Exec line class argument, because that might reset the profile dir!
+                            # If we change --class in Exec, chrome might generate a NEW hash next time.
+                            # We just want the .desktop file to match the RESULTING class.
+                            
+                            if [[ -f "$OLD_ICON" ]]; then
+                                cp "$OLD_ICON" "$NEW_ICON"
+                            fi
+                            
+                            command -v notify-send &> /dev/null && notify-send "Webapp Fixed" "Icon and ID updated for $ACTUAL_CLASS"
+                        fi
+                    fi
+                    break
+                fi
+            done
+        ) &
+    fi
+
+    # Disown so the script can exit without killing the app
+    disown
+}
+
+function main_menu() {
+    echo "Webapp Manager"
+    echo "--------------"
+    
+    if command -v gum &> /dev/null; then
+        CHOICE=$(gum choose "Install Web App" "Remove Web App" "List Web Apps" "Exit")
+    else
+        PS3="Select an option: "
+        select CHOICE in "Install Web App" "Remove Web App" "List Web Apps" "Exit"; do
+            break
+        done
+    fi
+
+    case "$CHOICE" in
+        "Install Web App") install_app ;;
+        "Remove Web App") remove_app ;;
+        "List Web Apps") list_apps ;;
+        "Exit") exit 0 ;;
+        *) echo "Invalid option"; exit 1 ;;
+    esac
+}
+
+if [[ "$#" -eq 0 ]]; then
+    main_menu
+else
+    case $1 in
+        install) shift; install_app "$@" ;;
+        remove) shift; remove_app "$@" ;;
+        list) list_apps ;;
+        launch) shift; launch_app "$@" ;;
+        *) show_help ;;
+    esac
+fi
